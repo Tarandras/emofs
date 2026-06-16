@@ -1,6 +1,6 @@
 clear all 
 close all 
-
+addpath('..')
 %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
 % Experiment Settings
 %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
@@ -20,11 +20,24 @@ HalfPeriod_L = [ x_max+(x_max - x_min)*3 y_max+(y_max - y_min)*3 ];
 Mixture_N = 20; % total number of mixture components
 Trimming_Factor = 20; 
 Convergence_Factor = 0.0000001;
+Convergence_Debug = true; 
 % view settings
 my_xlim = 60; 
 my_ylim = 60; 
 my_zlim = 0.011;
 my_view = [348 21];
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+% Load Python Model
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+parentDir = fullfile(pwd, '..');
+if count(py.sys.path, parentDir) == 0
+    insert(py.sys.path, int32(0), parentDir);
+end
+py.importlib.invalidate_caches();
+
+mod = py.importlib.import_module('flow_models');
+py.importlib.reload(mod);
 
 %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
 % Sample generation
@@ -43,8 +56,8 @@ y_samples_poisson = poissrnd(p_lambda_y, sampleSize, 1);
 x_input = [x_samples_gaussian x_samples_uniform x_samples_poisson];
 y_input = [y_samples_gaussian y_samples_uniform y_samples_poisson];
 inputArray = [x_input(:), y_input(:)];
-idx = randperm(size(inputArray, 2));
-inputArray = inputArray(:, idx);
+idx = randperm(size(inputArray,1));
+inputArray = inputArray(idx, :);
 % plot input in scattered form 
 figure;
 scatter(x_input, y_input);
@@ -54,7 +67,7 @@ scatter(x_input, y_input);
 %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
 [pdf_index, Estimated_PDF] = emofs( ...
     inputArray, HalfPeriod_L, Mixture_N, Trimming_Factor, ...
-    Convergence_Factor); 
+    Convergence_Factor, Convergence_Debug); 
 % Generate X,Y,Z indices from pdf_index
 MaxPeriod = max(HalfPeriod_L) * 2 + 1;
 x_axis = pdf_index(:,1);
@@ -108,82 +121,111 @@ gmdist = fitgmdist(inputArray, Mixture_N,'Options',options); % Mixture_N compone
 grid_points = [x_axis, y_axis];
 f = pdf(gmdist, grid_points);
 Z_igmm = reshape(f, MaxPeriod, MaxPeriod);
-% Plot
-figure;
-h1 = surf(X, Y, Z_igmm);
-xlabel('x (in)');
-ylabel('y (in)');
-zlabel('Estimated PDF by IGMM');
-set(gca,'ydir','reverse');
-
 
 %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
-% Draw EMoFS and Original Together
+% Masked Autoregressive Flow Estimation
 %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
-% create the first surface using colors from the winter colormap
-fig = figure(); 
-tcl = tiledlayout(fig,1,1); 
-ax = nexttile(tcl); 
-surf1Colormap = winter(); 
-tc = colormapToTruecolor(surf1Colormap,Z_orig);  
-hsurf1 = surf(ax,X,Y,Z_orig,tc,'FaceColor','interp','EdgeAlpha',0.3);
-set(hsurf1, 'FaceAlpha', 0.2);
-% create second surface using colors from the autumn colormap
-hold on
-surf2Colormap = spring(); 
-tc = colormapToTruecolor(surf2Colormap,Z_emofs);
-hsurf2 = surf(ax,X,Y,Z_emofs,tc,'FaceColor','interp','EdgeAlpha',0.3);
-axHidden = axes(tcl,'visible','off','HandleVisibility','off');
-colormap(ax,surf1Colormap)
-colormap(axHidden,surf2Colormap)
-cb1 = colorbar(ax);
-cb1.Layout.Tile = 'east';
-cb1.Label.String = 'Original PDF';
-cb2 = colorbar(axHidden);
-cb2.Layout.Tile = 'east';
-cb2.Label.String = 'Estimation by EMoFS';
-xlim([ -my_xlim my_xlim ]);
-ylim([ -my_ylim my_ylim ]);
-zlim([0 my_zlim]);
-view( my_view );
-xlabel('x (in)');
-ylabel('y (in)');
-zlabel('Original PDF vs EMoFS');
+model_type = 'maf';  % 'maf' | 'nsf' | 'realnvp'
+result = mod.run_flow( ...
+    py.numpy.array(inputArray), ...
+    py.numpy.array(grid_points), ...
+    model_type);
+p = double(result);
+Z_maf = reshape(p, MaxPeriod, MaxPeriod);
 
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+% Neural Spline Flow Estimation
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+model_type = 'nsf';  % 'maf' | 'nsf' | 'realnvp'
+result = mod.run_flow( ...
+    py.numpy.array(inputArray), ...
+    py.numpy.array(grid_points), ...
+    model_type);
+p = double(result);
+Z_nsf = reshape(p, MaxPeriod, MaxPeriod);
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+% Real-valued Non-Volume Preserving flows
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+model_type = 'realnvp';  % 'maf' | 'nsf' | 'realnvp'
+result = mod.run_flow( ...
+    py.numpy.array(inputArray), ...
+    py.numpy.array(grid_points), ...
+    model_type);
+p = double(result);
+Z_realnvp = reshape(p, MaxPeriod, MaxPeriod);
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+% Wavelet Density Estimator
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+% Grid histogram (raw density)
+bins = MaxPeriod+1;
+edges1 = linspace(min(inputArray(:,1)), max(inputArray(:,1)), bins);
+edges2 = linspace(min(inputArray(:,2)), max(inputArray(:,2)), bins);
+H = histcounts2(inputArray(:,1), inputArray(:,2), edges1, edges2);
+H = H / sum(H(:)); % normalize
+% Wavelet decomposition
+wavelet = 'db2';
+level = 2;
+[C,S] = wavedec2(H, level, wavelet);
+% Thresholding (denoising)
+sigma = median(abs(C)) / 0.6745;
+threshold = sigma * sqrt(2*log(numel(H)));
+C_filt = wthresh(C, 's', threshold);
+% Reconstruction
+H_smooth = waverec2(C_filt, S, wavelet);
+% Ensure positivity
+H_smooth = max(H_smooth, 0);
+H_smooth = H_smooth / sum(H_smooth(:));
+Z_wavelet = reshape(H_smooth, MaxPeriod, MaxPeriod);
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+% KDE 
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+[f, xi, bw] = ksdensity(inputArray, grid_points); 
+Z_kde = reshape(f, MaxPeriod, MaxPeriod);
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+% Draw Wavelet and Original Together
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+drawTogether(X, Y, my_xlim, my_ylim, my_zlim, my_view, Z_orig, ...
+    Z_wavelet, 'Original PDF vs Wavelet', 'Estimation by Wavelet')
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+% Draw RealNPV and Original Together
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+drawTogether(X, Y, my_xlim, my_ylim, my_zlim, my_view, Z_orig, ...
+    Z_realnvp, 'Original PDF vs RealNVP', 'Estimation by RealNVP')
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+% Draw NSF and Original Together
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+drawTogether(X, Y, my_xlim, my_ylim, my_zlim, my_view, Z_orig, Z_nsf, ...
+    'Original PDF vs NSF', 'Estimation by NSF')
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+% Draw MAF and Original Together
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+drawTogether(X, Y, my_xlim, my_ylim, my_zlim, my_view, Z_orig, Z_maf, ...
+    'Original PDF vs MAF', 'Estimation by MAF')
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+% Draw KDE and Original Together
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+drawTogether(X, Y, my_xlim, my_ylim, my_zlim, my_view, Z_orig, Z_emofs, ...
+    'Original PDF vs KDE', 'Estimation by KDE')
 
 %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
 % Draw IGMM and Original Together
 %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
-% create the first surface using colors from the winter colormap
-fig = figure(); 
-tcl = tiledlayout(fig,1,1); 
-ax = nexttile(tcl); 
-surf1Colormap = winter(); 
-tc = colormapToTruecolor(surf1Colormap,Z_orig);  
-hsurf1 = surf(ax,X,Y,Z_orig,tc,'FaceColor','interp','EdgeAlpha',0.3);
-set(hsurf1, 'FaceAlpha', 0.2);
-% create second surface using colors from the autumn colormap
-hold on
-surf2Colormap = spring(); 
-tc = colormapToTruecolor(surf2Colormap,Z_igmm);
-hsurf2 = surf(ax,X,Y,Z_igmm,tc,'FaceColor','interp','EdgeAlpha',0.3);
-axHidden = axes(tcl,'visible','off','HandleVisibility','off');
-colormap(ax,surf1Colormap)
-colormap(axHidden,surf2Colormap)
-cb1 = colorbar(ax);
-cb1.Layout.Tile = 'east';
-cb1.Label.String = 'Original PDF';
-cb2 = colorbar(axHidden);
-cb2.Layout.Tile = 'east';
-cb2.Label.String = 'Estimation by IGMM';
-xlim([ -my_xlim my_xlim ]);
-ylim([ -my_ylim my_ylim ]);
-zlim([0 my_zlim]);
-view( my_view );
-xlabel('x (in)');
-ylabel('y (in)');
-zlabel('Original PDF vs IGMM');
+drawTogether(X, Y, my_xlim, my_ylim, my_zlim, my_view, Z_orig, Z_igmm, ...
+    'Original PDF vs IGMM', 'Estimation by IGMM')
 
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+% Draw EMoFS and Original Together
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+drawTogether(X, Y, my_xlim, my_ylim, my_zlim, my_view, Z_orig, Z_emofs, ...
+    'Original PDF vs EMoFS', 'Estimation by EMoFS')
 
 %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
 % RMS calculation

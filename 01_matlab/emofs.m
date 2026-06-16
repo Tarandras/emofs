@@ -3,13 +3,17 @@
 %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
 function [pdf_index, Mixture_Out] = emofs( ...
     inputArray, HalfPeriod_L, Mixture_Count_N, Trimming_Factor, ...
-    Convergence_Factor)
+    Convergence_Factor, Convergence_Debug)
 
+    %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+    %% Design decision
+    %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+    MAX_ITERATION = 1000; 
+  
     %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
     %% Input sizes
     %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
     [~, rCount] = size(inputArray);
-    
     if ~isscalar(Mixture_Count_N)
         error("Mixture_Count_N must be scalar");
     end
@@ -33,6 +37,7 @@ function [pdf_index, Mixture_Out] = emofs( ...
     %% Construct mixture indices (vectorized)
     %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
     gridCells = cell(1, rCount);
+    %[gridCells{:}] = ndgrid(1:Mixture_Count_N);
     [gridCells{:}] = ndgrid(-Mixture_Count_N:Mixture_Count_N);
     mixture_indices = reshape(cat(rCount+1, gridCells{:}), [], rCount);
     mixtureCount = size(mixture_indices, 1);
@@ -52,7 +57,14 @@ function [pdf_index, Mixture_Out] = emofs( ...
     %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
     %% EM Iterations
     %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
-    for iteration = 1:100 % Design decision taking IGMM as reference
+    if Convergence_Debug
+        error_diff_A_history = zeros(MAX_ITERATION, mixtureCount);
+        error_diff_B_history = zeros(MAX_ITERATION, mixtureCount);
+        rate_A_history = zeros(MAX_ITERATION, mixtureCount);
+        rate_B_history = zeros(MAX_ITERATION, mixtureCount);
+        tao_MixturesA_bckup = zeros(MAX_ITERATION, mixtureCount);
+    end
+    for iteration = 1:MAX_ITERATION % Design decision taking IGMM as reference
         % Convergence backup
         tao_MixturesA_convergence  = tao_MixturesA;
         tao_MixturesB_convergence  = tao_MixturesB;
@@ -95,21 +107,104 @@ function [pdf_index, Mixture_Out] = emofs( ...
         error_diff_B = tao_MixturesB_convergence - tao_MixturesB;
         error_rms_A = sqrt(sum(error_diff_A.^2, "all")); 
         error_rms_B = sqrt(sum(error_diff_B.^2, "all")); 
+        if Convergence_Debug
+            error_diff_A_history(iteration, :) = error_diff_A.';
+            error_diff_B_history(iteration, :) = error_diff_B.';
+            rate_A_history(iteration, :) = (tao_MixturesA_convergence ...
+                ./ tao_MixturesA).';
+            rate_B_history(iteration, :) = (tao_MixturesB_convergence ...
+                ./ tao_MixturesB).';
+            tao_MixturesA_bckup(iteration, :) = tao_MixturesA;
+        end
         %fprintf("Convergence RMS, A and B, at %d th cycle:" + ...
         %    " %f; %f\n", iteration, error_rms_A, error_rms_B);
         if( error_rms_A <= Convergence_Factor && ...
                 error_rms_B <= Convergence_Factor)
-            fprintf("EMoFS: Converged at %d th iteration\n", iteration);
+            fprintf("Converged at %d th iteration\n", iteration);
             break;
         end
             
     end
 
-    if( iteration == 100 )
-        fprintf("EMoFS: Failed to converge in %d iterations for emofs" + ...
+    %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+    %% Check Convergence
+    %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+    if( iteration == MAX_ITERATION )
+        fprintf("Failed to converge in %d iterations for emofs" + ...
             " with %d components\n", iteration, Mixture_Count_N);
     end
     
+    %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+    %% Convergence Debug
+    %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+    if Convergence_Debug
+        figure;
+        colors = parula(Mixture_Count_N);
+        for plotter = 1:Mixture_Count_N
+            plot( 1:iteration, ...
+              abs( tao_MixturesA_bckup(1:iteration, plotter) ...
+                   - tao_MixturesA(plotter) ), ...
+              'Color', colors(plotter,:), ...
+              'LineWidth', 0.7 );
+    
+            hold on
+        end
+        xlabel('Iteration');
+        ylabel('Error Per Iteration');
+        colormap(parula);
+        cb = colorbar;
+        cb.Label.String = 'Mixture Index';
+        caxis([1 Mixture_Count_N]);
+        hold off
+    
+        
+        size(tao_MixturesA_bckup(1,:))
+        size(tao_MixturesA)
+        err = zeros(MAX_ITERATION, mixtureCount);
+        ratio = zeros(MAX_ITERATION-1, mixtureCount);
+        for k = 1:iteration
+            err(k,:) = abs(tao_MixturesA_bckup(k,:) - tao_MixturesA');
+        end
+        for k = 1:iteration-1
+            ratio(k,:) = err(k+1,:) ./ err(k,:);
+        end
+        figure;
+        plot(ratio)
+        ylabel('Convergence Ratio')
+        xlabel('Iteration')
+  
+        figure;
+        colors = parula(Mixture_Count_N);
+        for plotter = 1:Mixture_Count_N
+            plot(abs(error_diff_A_history(1:(floor(iteration/2)), ...
+                plotter)), 'Color', colors(plotter,:), 'LineWidth', 0.7 );
+            hold on
+        end
+        xlabel('Iteration');
+        ylabel('a(t+1) / a(t) Rate');
+        colormap(parula);
+        cb = colorbar;
+        cb.Label.String = 'Mixture Index';
+        caxis([1 Mixture_Count_N]);
+        hold off
+    
+        figure;
+        colors = parula(Mixture_Count_N);
+        for plotter = 1:Mixture_Count_N
+            plot( abs(rate_A_history(1:floor(iteration/2), plotter)), ...
+                  'Color', colors(plotter,:), ...
+                  'LineWidth', 0.7 );
+            hold on
+        end
+        xlabel('Iteration');
+        ylabel('a(t+1) / a(t) Rate');
+        colormap(parula);
+        cb = colorbar;
+        cb.Label.String = 'Mixture Index';
+        caxis([1 Mixture_Count_N]);
+        hold off
+    end
+
     %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
     %% Compute Mixture_Out (vectorized)
     %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%

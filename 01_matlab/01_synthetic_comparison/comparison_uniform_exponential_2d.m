@@ -1,6 +1,6 @@
 clear all 
 close all 
-
+addpath('..')
 %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
 % Experiment Settings
 %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
@@ -23,11 +23,24 @@ HalfPeriod_L = [ x_max+(x_max - x_min)*5 y_max+(y_max - y_min)*5 ];
 Mixture_N = 25; % total number of mixture components
 Trimming_Factor = 10; 
 Convergence_Factor = 0.000001;
+Convergence_Debug = true;
 % view preferences
 my_xlim = 50; 
 my_ylim = 50; 
 my_zlim = 0.009;
 my_view = [420 29];
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+% Load Python Model
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+parentDir = fullfile(pwd, '..');
+if count(py.sys.path, parentDir) == 0
+    insert(py.sys.path, int32(0), parentDir);
+end
+py.importlib.invalidate_caches();
+
+mod = py.importlib.import_module('flow_models');
+py.importlib.reload(mod);
 
 %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
 % Sample generation
@@ -43,8 +56,8 @@ y_samples_exponential = exprnd(e_mu_y, sampleSize, 1) + exp_offset;
 x_input = [ x_samples_uniform  x_samples_exponential];
 y_input = [ y_samples_uniform  y_samples_exponential];
 inputArray = [x_input(:), y_input(:)];
-idx = randperm(size(inputArray, 2));
-inputArray = inputArray(:, idx);
+idx = randperm(size(inputArray,1));
+inputArray = inputArray(idx, :);
 % plot input in scattered form 
 figure;
 scatter(x_input, y_input);
@@ -54,7 +67,7 @@ scatter(x_input, y_input);
 %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
 [pdf_index, Estimated_PDF] = emofs( ...
     inputArray, HalfPeriod_L, Mixture_N, Trimming_Factor, ...
-    Convergence_Factor); 
+    Convergence_Factor, Convergence_Debug); 
 % Generate X,Y,Z indices from pdf_index
 MaxPeriod = max(HalfPeriod_L) * 2 + 1;
 x_axis = pdf_index(:,1);
@@ -111,6 +124,100 @@ xlabel('x (in)');
 ylabel('y (in)');
 zlabel('Estimated PDF by IGMM');
 set(gca,'ydir','reverse');
+
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+% Masked Autoregressive Flow Estimation
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+model_type = 'maf';  % 'maf' | 'nsf' | 'realnvp'
+result = mod.run_flow( ...
+    py.numpy.array(inputArray), ...
+    py.numpy.array(grid_points), ...
+    model_type);
+p = double(result);
+Z_maf = reshape(p, MaxPeriod, MaxPeriod);
+figure;
+h1 = surf(X, Y, Z_maf, 'EdgeColor','none');
+xlabel('x (in)');
+ylabel('y (in)');
+zlabel('Estimated PDF by MAF');
+view(3);
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+% Neural Spline Flow Estimation
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+model_type = 'nsf';  % 'maf' | 'nsf' | 'realnvp'
+result = mod.run_flow( ...
+    py.numpy.array(inputArray), ...
+    py.numpy.array(grid_points), ...
+    model_type);
+p = double(result);
+Z_nsf = reshape(p, MaxPeriod, MaxPeriod);
+figure;
+h1 = surf(X, Y, Z_nsf, 'EdgeColor','none');
+xlabel('x (in)');
+ylabel('y (in)');
+zlabel('Estimated PDF by NSF');
+view(3);
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+% Real-valued Non-Volume Preserving flows
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+model_type = 'realnvp';  % 'maf' | 'nsf' | 'realnvp'
+result = mod.run_flow( ...
+    py.numpy.array(inputArray), ...
+    py.numpy.array(grid_points), ...
+    model_type);
+p = double(result);
+Z_realnvp = reshape(p, MaxPeriod, MaxPeriod);
+figure;
+h1 = surf(X, Y, Z_realnvp, 'EdgeColor','none');
+xlabel('x (in)');
+ylabel('y (in)');
+zlabel('Estimated PDF by Real NVP');
+view(3);
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+% Wavelet Density Estimator
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+% Grid histogram (raw density)
+bins = MaxPeriod+1;
+edges1 = linspace(min(inputArray(:,1)), max(inputArray(:,1)), bins);
+edges2 = linspace(min(inputArray(:,2)), max(inputArray(:,2)), bins);
+H = histcounts2(inputArray(:,1), inputArray(:,2), edges1, edges2);
+H = H / sum(H(:)); % normalize
+% Wavelet decomposition
+wavelet = 'db2';
+level = 2;
+[C,S] = wavedec2(H, level, wavelet);
+% Thresholding (denoising)
+sigma = median(abs(C)) / 0.6745;
+threshold = sigma * sqrt(2*log(numel(H)));
+C_filt = wthresh(C, 's', threshold);
+% Reconstruction
+H_smooth = waverec2(C_filt, S, wavelet);
+% Ensure positivity
+H_smooth = max(H_smooth, 0);
+H_smooth = H_smooth / sum(H_smooth(:));
+Z_wavelet = reshape(H_smooth, MaxPeriod, MaxPeriod);
+figure;
+h1 = surf(X, Y, Z_wavelet, 'EdgeColor','none');
+xlabel('x (in)');
+ylabel('y (in)');
+zlabel('Estimated PDF by Wavelet');
+view(3);
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+% KDE 
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+[f, xi, bw] = ksdensity(inputArray, grid_points); 
+Z_kde = reshape(f, MaxPeriod, MaxPeriod);
+figure;
+h1 = surf(X, Y, Z_kde, 'EdgeColor','none');
+xlabel('x (in)');
+ylabel('y (in)');
+zlabel('Estimated PDF by KDE');
+view(3);
 
 %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
 % Draw EMoFS and Original Together
@@ -186,23 +293,30 @@ zlabel('Original PDF vs IGMM');
 %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
 % RMS calculation
 %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
-error_diff = Z_orig - Z_emofs;
-error_rms = sqrt(sum(error_diff.^2, "all")); 
-fprintf("RMS EMoFS:  %f\n", error_rms);
-fprintf("Total Sum EMoFS: %f\n", sum(Z_emofs, "all"));
-error_diff = Z_orig - Z_igmm;
-error_rms = sqrt(sum(error_diff.^2, "all")); 
-fprintf("RMS IGMM:  %f\n", error_rms);
-fprintf("Total Sum IGMM: %f\n", sum(Z_igmm, "all"));
+error_diff_emofs = Z_orig - Z_emofs;
+error_rms_emofs = sqrt(sum(error_diff_emofs.^2, "all")); 
+fprintf("RMS EMoFS:  %f\n", error_rms_emofs);
 
+error_diff_igmm = Z_orig - Z_igmm;
+error_rms_igmm = sqrt(sum(error_diff_igmm.^2, "all")); 
+fprintf("RMS IGMM:  %f\n", error_rms_igmm);
 
-%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
-% colormapToTruecolor description
-%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
-function tc = colormapToTruecolor(map,ZData)
-    % map is a n-by-3 colormap matrix
-    % ZData is a k-by-w matrix of ZData (or CData, I suppose)
-    % tc is a kxwx3 Truecolor array based on map and ZData values.
-    tcIdx = round(rescale(ZData,1,height(map)));
-    tc = reshape(map(tcIdx,:),[size(ZData),3]);
-end
+error_diff_kde = Z_orig - Z_kde;
+error_rms_kde = sqrt(sum(error_diff_kde.^2, "all")); 
+fprintf("RMS KDE:  %f\n", error_rms_kde);
+
+error_diff_wavelet = Z_orig - Z_wavelet;
+error_rms_wavelet = sqrt(sum(error_diff_wavelet.^2, "all")); 
+fprintf("RMS WDE:  %f\n", error_rms_wavelet);
+
+error_diff_maf = Z_orig - Z_maf;
+error_rms_maf = sqrt(sum(error_diff_maf.^2, "all")); 
+fprintf("RMS MAF:  %f\n", error_rms_maf);
+
+error_diff_nvp = Z_orig - Z_realnvp;
+error_rms_nvp = sqrt(sum(error_diff_nvp.^2, "all")); 
+fprintf("RMS RealNVP:  %f\n", error_rms_nvp);
+
+error_diff_nsf = Z_orig - Z_nsf;
+error_rms_nsf = sqrt(sum(error_diff_nsf.^2, "all")); 
+fprintf("RMS NSF:  %f\n", error_rms_nsf);
